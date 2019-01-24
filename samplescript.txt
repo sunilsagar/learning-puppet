@@ -1,0 +1,1591 @@
+[root@puppetmaster puppet-enterprise-2019.0.1-el-7-x86_64]# cat puppet-enterprise-installer
+#!/bin/bash +x
+
+#==============================================================================
+# Copyright @ 2016 Puppet, Inc.
+# Redistribution prohibited.
+# Address: 308 SW 2nd Ave., 5th Floor Portland, OR 97204
+# Phone: (877) 575-9775
+# Email: info@puppet.com
+#===============================================================================
+
+#===[ Summary ]=================================================================
+
+# This program installs Puppet Enterprise. Run this file to start the
+# installation or run with a "-h" option to display help.
+
+#===[ Conventions ]=============================================================
+
+# See style guide
+
+#===============================================================================
+
+#===[ Global Varables ]=========================================================
+
+# Directory paths
+readonly INSTALLER_DIR="$(readlink -f "$(dirname "${0}")")"
+readonly LOGFILE_DIR='/var/log/puppetlabs/installer'
+readonly LOGFILE_NAME="$(date +'%Y-%m-%dT%H.%M.%S%z').install.log"
+readonly LOGFILE_PATH="${LOGFILE_DIR}/${LOGFILE_NAME}"
+readonly ENVIRONMENTPATH='/opt/puppetlabs/server/data/environments'
+readonly ENVIRONMENT='enterprise'
+readonly PACKAGE_DIR='/opt/puppetlabs/server/data/packages/public'
+readonly PUPPET_DIR='/opt/puppetlabs/puppet'
+readonly PUPPET_BIN_DIR='/opt/puppetlabs/puppet/bin'
+readonly PUPPET_SHARE_DIR='/opt/puppetlabs/puppet/share'
+readonly SERVER_DIR="/opt/puppetlabs/server"
+readonly OLD_OPT_DIR="/opt/puppet"
+readonly ENTERPRISE_DIR="/etc/puppetlabs/enterprise"
+readonly ENTERPRISE_CONF_DIR="/etc/puppetlabs/enterprise/conf.d"
+readonly ENTERPRISE_CONF_PATH="${ENTERPRISE_CONF_DIR}/pe.conf"
+readonly DEFAULT_CONF_FILE_PATH="${INSTALLER_DIR?}/conf.d/pe.conf"
+
+# gettext i18n variables
+export TEXTDOMAINDIR
+readonly TEXTDOMAINDIR="${INSTALLER_DIR}/locales"
+export TEXTDOMAIN="puppet-enterprise"
+
+# Common variables
+# NOTE: Upgrading to 2019.0 and later requires MCO to be disabled which was
+#       not implemented until 2018.1.1.
+readonly MINIMUM_SUPPORTED_VERSION="2018.1.1"
+# Format: '%Y.%m.%d'
+readonly EFFECTIVE_DATE='2018.11.06'
+# At the moment we can only attempt to rollback if the version we were
+# upgrading from has a pe-modules package.
+readonly MINIMUM_VERSION_FOR_ROLLBACK="2016.4.6"
+readonly SCRIPT_NAME="$(basename "${0}")"
+readonly PE_REPO_NAME='puppet_enterprise'
+# if a default editor is not set, use vi
+if [[ -z $EDITOR ]]; then
+    readonly EDITOR=vi
+fi
+readonly APT_GET_ARGS="-o Apt::Get::Purge=false \
+-o Dpkg::Options::='--force-confold' \
+-o Dpkg::Options::='--force-confdef' \
+-o Dpkg::Options::='--force-confmiss' \
+--no-install-recommends"
+
+# Initialize gettext for i18n
+#
+# Falls back to a fake gettext() if gettext.sh can't be found so that the
+# user can still see output if they don't have gettext.
+if type gettext.sh >/dev/null 2>&1; then
+  # shellcheck disable=SC1091
+  . gettext.sh
+else
+  echo "[WARNING] Unable to load gettext.sh."
+  echo "[WARNING] Please install the gettext package if you would like translated instructions."
+
+  # Fake gettext function
+  gettext() {
+    printf "%s" "${1}"
+  }
+
+  # Fake eval_gettext function
+  eval_gettext() {
+    # eval_gettext() as defined in gettext.sh uses envsubst, so we will reproduce
+    # that usage here.
+    # shellcheck disable=SC2006,SC2046,SC2086
+    expanded="$(eval echo \"$1\")"
+    gettext "${expanded}"
+  }
+fi
+
+#=== FUNCTION ================================================================
+#        NAME:  get_timestamp
+# DESCRIPTION:  Provides a way of getting a RFC 3339 timestamp
+#=============================================================================
+get_timestamp() {
+  local timestamp
+  timestamp=$(date +'%Y-%m-%dT%H:%M:%S.%3N%:z')
+  echo "${timestamp:0:29}"
+}
+
+#=== FUNCTION ================================================================
+#        NAME:  err
+# DESCRIPTION:  A function so as to provide a shorthand error command
+#=============================================================================
+err() {
+  printf "%s [ERROR]: %s\n" "$(get_timestamp)" "$@" >&2 | tee -a "${LOGFILE_PATH?}"
+}
+
+# Source bootstrap-metadata. This file is generated at compose time
+# and contains the following variables:
+# PE_BUILD_VERSION, AIO_AGENT_VERSION and PLATFORM_TAG
+readonly BOOTSTRAP_METADATA="${INSTALLER_DIR?}/packages/bootstrap-metadata"
+if [[ -f $BOOTSTRAP_METADATA ]]; then
+  # the below shellcheck comment is needed to make shellcheck happy,
+  # as it attempts to actually source the file, which is dynamically
+  # generated at compose time.
+  #
+  # shellcheck source=/dev/null
+  source "${BOOTSTRAP_METADATA}"
+else
+  err "packages/bootstrap-metadata file missing"
+  exit 1
+fi
+
+readonly BUILD_DATE_FILE="${SERVER_DIR}/effective_date"
+if [[ -f $BUILD_DATE_FILE ]]; then
+    readonly INSTALLED_EFFECTIVE_DATE=$(cat "${BUILD_DATE_FILE}")
+else
+    # We are setting this to 0 because lexicographically,
+    # 0 is less than our version strings and will allow us
+    # to upgrade if the existing version does not have a
+    # build date file.
+    readonly INSTALLED_EFFECTIVE_DATE="0"
+fi
+
+# The following globals are set by option flags and will be set to
+# readonly after parsing.
+CONF_FILE_PATH=""
+IS_DEBUG='false'
+#IS_NOOP='false'
+IS_SUPPRESS_OUTPUT='false'
+#IS_VERBOSE_DEBUG='false'
+IS_INTERACTIVE_MODE='true'
+PE_MODULES_NAME='pe-modules'
+IS_PREP_ONLY='false'
+
+#=== FUNCTION ================================================================
+#        NAME:  get_unix_timestamp
+# DESCRIPTION:  Provides a way of getting a unix style timestamp
+#=============================================================================
+get_unix_timestamp() {
+  local timestamp
+  timestamp=$(date +'%s')
+  echo "${timestamp}"
+}
+
+#=== FUNCTION ================================================================
+#        NAME:  gettext_err
+# DESCRIPTION:  A function to log translated error followed by the error as
+#               written in script. Prefer this function if the text should
+#               be translated.
+#=============================================================================
+gettext_err() {
+  # shellcheck disable=SC2006
+  translation="`gettext \"${1}\"`"
+  err "${translation}"
+}
+
+#=== FUNCTION ================================================================
+#        NAME:  eval_gettext_err
+# DESCRIPTION:  A function to log translated error followed by the error as
+#               written in script. Prefer this function if the text should
+#               be translated and the text contains parameters to be interpreted..
+#=============================================================================
+eval_gettext_err() {
+  # shellcheck disable=SC2006
+  translation="`eval_gettext \"${1}\"`"
+  err "${translation}"
+}
+
+#=== FUNCTION ================================================================
+#        NAME:  gettext_wrapped_err
+# DESCRIPTION:  A function to log an error wrapped in an arbitrary string
+#      PARAMS:
+#               1. Error to be translated and logged
+#               2. String to pre and postfix to error
+#
+#=============================================================================
+gettext_wrapped_err() {
+  # shellcheck disable=SC2006
+  translation="`gettext \"${1}\"`"
+  err "${2} ${translation} ${2}"
+}
+
+#=== FUNCTION ================================================================
+#        NAME:  eval_gettext_wrapped_err
+# DESCRIPTION:  A function to log translated error followed by the error as
+#               written in script. Prefer this function if the text should
+#               be translated and the text contains parameters to be interpreted..
+#=============================================================================
+eval_gettext_wrapped_err() {
+  # shellcheck disable=SC2006
+  translation="`eval_gettext \"${1}\"`"
+  err "${2} ${translation} ${2}"
+}
+
+#=== FUNCTION ================================================================
+#        NAME:  cmd
+# DESCRIPTION:  A portable 'which' command
+#   ARGUMENTS:
+#               1. Name of the program to see if it is installed
+#=============================================================================
+cmd() {
+  local program_name="${1?}"
+  hash "${program_name?}" >&/dev/null;
+}
+
+#=== FUNCTION ================================================================
+#        NAME:  run
+# DESCRIPTION:  A function so as to provide a shorthand run and log command
+#   ARGUMENTS:
+#               1. Command to run
+#=============================================================================
+run() {
+  local run_command="${1?}"
+  # shellcheck disable=SC2006
+  run_command_translation="`gettext 'Running command'`"
+  printf "%s ${run_command_translation}: %s\n" "$(get_timestamp)" "${run_command}" 2>&1 | tee -a "${LOGFILE_PATH?}"
+  ( eval "${run_command?}" ) 2>&1 | tee -a "${LOGFILE_PATH?}"
+  # Return the status of the command, not tee
+  return "${PIPESTATUS[0]}"
+}
+
+#=== FUNCTION ================================================================
+#        NAME:  display
+# DESCRIPTION:  Echo and log
+#   ARGUMENTS:
+#               1. Message to be echoed and logged
+#=============================================================================
+display() {
+  local message="${1?}"
+  echo "${message}" 2>&1 | tee -a "${LOGFILE_PATH?}"
+}
+
+#=== FUNCTION ================================================================
+#        NAME:  gettext_display
+# DESCRIPTION:  Translate, echo and log. Prefer this function over
+#               display if the text should be translated.
+#   ARGUMENTS:
+#               1. Message to be translated, echoed and logged
+#=============================================================================
+gettext_display() {
+  # shellcheck disable=SC2006
+  translation="`gettext \"${1}\"`"
+  display "${translation}"
+}
+
+#=== FUNCTION ================================================================
+#        NAME:  eval_gettext_display
+# DESCRIPTION:  Translate, echo and log. Prefer this function over
+#               display if the text should be translated and the text
+#               contains parameters that need to be interpreted.
+#   ARGUMENTS:
+#               1. Message to be translated, echoed and logged
+#=============================================================================
+eval_gettext_display() {
+  # shellcheck disable=SC2006
+  translation="`eval_gettext \"${1}\"`"
+  display "${translation}"
+}
+
+#=== FUNCTION ================================================================
+#        NAME:  display_announcement
+# DESCRIPTION:  Announce something to the user
+#   ARGUMENTS:
+#               1. Message to be announced
+#=============================================================================
+display_announcement() {
+  local message="${1?}"
+  display_new_line
+  display "## ${message}"
+  display_new_line
+}
+
+#=== FUNCTION ================================================================
+#        NAME:  gettext_display_announcement
+# DESCRIPTION:  Announce something to the user. Prefer this function over
+#               display_announcement if the text should be translated.
+#   ARGUMENTS:
+#               1. Message to be translated and announced
+#=============================================================================
+gettext_display_announcement() {
+  # shellcheck disable=SC2006
+  translation="`gettext \"${1}\"`"
+  display_announcement "${translation}"
+}
+
+#=== FUNCTION ================================================================
+#        NAME:  eval_gettext_display_announcement
+# DESCRIPTION:  Announce something to the user. Prefer this function over
+#               display_announcement if the text should be translated.
+#   ARGUMENTS:
+#               1. Message to be translated and announced
+#=============================================================================
+eval_gettext_display_announcement() {
+  # shellcheck disable=SC2006
+  translation="`eval_gettext \"${1}\"`"
+  display_announcement "${translation}"
+}
+
+#=== FUNCTION ================================================================
+#        NAME:  display_line_break
+# DESCRIPTION:  Display a line break
+#=============================================================================
+display_line_break() {
+  display "============================================================="
+}
+
+#=== FUNCTION ================================================================
+#        NAME:  display_new_line
+# DESCRIPTION:  Display an 80 character line break
+#=============================================================================
+display_new_line() {
+  display ""
+}
+
+#=== FUNCTION ================================================================
+#        NAME:  display_indented
+# DESCRIPTION:  Display indented text to the user.
+#   ARGUMENTS:
+#               1. Message to be displayed
+#               2. Number of 2-space-wide indents to use
+#=============================================================================
+display_indented() {
+  levels="${2}"
+  if [ -z "${levels}" ]; then
+    levels="2"
+  fi
+  for ((i=0; i<levels; i++)); do echo -n '  '; done
+  display "${1}"
+}
+
+#=== FUNCTION ================================================================
+#        NAME:  gettext_display_indented
+# DESCRIPTION:  Translate and display indented text to the user. Prefer this
+#               function over display_indented if the text should be translated.
+#   ARGUMENTS:
+#               1. Message to be translated and displayed
+#               2. Number of 2-space-wide indents to use
+#=============================================================================
+gettext_display_indented() {
+  # shellcheck disable=SC2006
+  translation="`gettext \"${1}\"`"
+  display_indented "${translation}" "${2}"
+}
+
+#=== FUNCTION ================================================================
+#        NAME:  eval_gettext_display_indented
+# DESCRIPTION:  Translate and display indented text with parameters to substitute
+#               to the user. Prefer this function over display_indented if the
+#               text should be translated.
+#   ARGUMENTS:
+#               1. Message to be translated and displayed
+#               2. Number of 2-space-wide indents to use
+#=============================================================================
+eval_gettext_display_indented() {
+  # shellcheck disable=SC2006
+  translation="`eval_gettext \"${1}\"`"
+  display_indented "${translation}" "${2}"
+}
+
+#=== FUNCTION ================================================================
+#        NAME:  display_pe_header
+# DESCRIPTION:  Displays the PE header
+#=============================================================================
+display_pe_header() {
+  display_line_break
+  gettext_display_indented "Puppet Enterprise Installer" '2'
+  display_line_break
+}
+
+#=== FUNCTION ==================================================================
+#        NAME:  print_usage
+# DESCRIPTION:  Print usage instructions.
+#===============================================================================
+print_usage() {
+flag_indentation="2"
+flag_desc_indentation="4"
+display "USAGE: ${SCRIPT_NAME?} [-c CONF_FILE] [-D] [-h] [-q] [-V] [-y] [-p]"
+display_new_line
+gettext_display "OPTIONS:"
+display_new_line
+display_indented "-c <PATH_TO_FILE>" "${flag_indentation}"
+gettext_display_indented "Use pe.conf at <PATH_TO_FILE>." "${flag_desc_indentation}"
+display_new_line
+eval_gettext_display_indented "If you don't use this flag on installation, the installer will create a pe.conf file for you and open in your EDITOR (\${EDITOR})." "${flag_desc_indentation}"
+display_new_line
+eval_gettext_display_indented "If you don't provide this flag on upgrade, the installer will attempt to use your pre-existing pe.conf, or if that file can't be found, it will create a pe.conf file and open it in your EDITOR (\${EDITOR})." "${flag_desc_indentation}"
+display_new_line
+gettext_display_indented "If you have a pre-existing pe.conf, the installer will overwrite it if you use this flag." "${flag_desc_indentation}"
+gettext_display_indented "Note that installer will create a backup of the pre-existing pe.conf before overwriting it." "${flag_desc_indentation}"
+display_indented "-D" "${flag_indentation}"
+gettext_display_indented "Display debugging information." "${flag_desc_indentation}"
+display_indented "-h" "${flag_indentation}"
+gettext_display_indented "Display this help." "${flag_desc_indentation}"
+display_indented "-q" "${flag_indentation}"
+gettext_display_indented "Run in quiet mode; the installation process is not displayed." "${flag_desc_indentation}"
+display_indented "-V" "${flag_indentation}"
+gettext_display_indented "Display very verbose debugging information." "${flag_desc_indentation}"
+display_indented "-y" "${flag_indentation}"
+eval_gettext_display_indented "Assume yes/default and bypass any prompts for user input or file editing using EDITOR (\${EDITOR})." "${flag_desc_indentation}"
+gettext_display_indented "Ensure that your pe.conf file is valid before using this flag." "${flag_desc_indentation}"
+display_indented "-p" "${flag_indentation}"
+gettext_display_indented "Prepare the system for future install." "${flag_desc_indentation}"
+gettext_display_indented "Will install packages and modules, but not run the final configure command." "${flag_desc_indentation}"
+}
+
+#=== FUNCTION ================================================================
+#        NAME: padded_version_string
+# DESCRIPTION: Takes a version string and pads it to make it easy for
+#              comparisons. Only pads to two places.
+#          $1: Version string
+#          $2: Padding for version string. (Optional)
+#=============================================================================
+padded_version_string() {
+    local version=$1
+    local padding="${2:-9999}"
+    local number_version=""
+
+    number_version="${version/rc/}"
+    # Replacing '-' with '.' and splitting version string on "."
+    # to get major, minor, patch parts.
+    IFS='.' read -r -a PARTS <<< "${number_version//-/.}"
+
+    # Removing git sha, which is always in the last part
+    if [[ "${version}" =~ [.-]g ]]; then
+        unset "PARTS[${#PARTS[@]}-1]"
+    fi
+
+    # Adding additional padding for PE-22545
+    # Some customers may be running an RC version and upgrading to
+    # a release version will fail. Padding all the way to RC's, but
+    # only for release versions (3 element versions like 2017.3.0).
+    #
+    # Skipping empty strings so a fresh install (empty string) will still
+    # compare properly.
+    if [ ${#PARTS[@]} == 3 ]; then
+        for ((i=${#PARTS[@]}; i<5; i++)); do
+            PARTS+=("${padding}")
+        done
+    fi
+    printf "%.4d" "${PARTS[@]#0}"
+}
+
+#=== FUNCTION ================================================================
+#        NAME: is_version_less_than
+# DESCRIPTION: Compares two version strings lexicographically to determine
+#              if the new one is an upgrade
+#          $1: Version string for the currently installed product
+#          $2: Version string of the product we want to install
+#          $3: Padding to use for version string. (Optional)
+#=============================================================================
+is_version_less_than() {
+    local current=$1
+    local new=$2
+    local padding="${3:-9999}"
+    local current_version=""
+    local new_version=""
+
+    current_version=$(padded_version_string "${current}" "${padding}")
+    new_version=$(padded_version_string "${new}" "${padding}")
+
+    if [[ "${current_version}" < "${new_version}" ]] || [[ "${current_version}" == "${new_version}" ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+#=== function ================================================================
+#        NAME:  custom_auth_conf
+# DESCRIPTION:  Returns true when the custom_auth_conf fact is true
+#=============================================================================
+custom_auth_conf() {
+  if [[ -n "$(existing_pe_version)" ]]; then
+    output=$(/opt/puppetlabs/puppet/bin/facter -p custom_auth_conf)
+    if [ "${output:-false}" = 'false' ]; then
+      return 1
+    else
+      return 0
+    fi
+  else
+    return 1
+  fi
+}
+
+#=== FUNCTION ================================================================
+#        NAME:  feature_flag
+# DESCRIPTION:  Returns true if the feature flag parameter is true in pe.conf
+#=============================================================================
+feature_flag() {
+  local flag="${1?}"
+  grep "${flag?}" "${CONF_FILE_PATH?}" | grep -q 'true'
+}
+
+#=== FUNCTION ================================================================
+#        NAME:  main
+# DESCRIPTION:  Controls program flow.
+#=============================================================================
+main() {
+  #----------------------------------------------------------------------------
+  # Check if we are running as root first
+  #----------------------------------------------------------------------------
+  if [[ "$(id -u)" -ne 0 ]]; then
+    eval_gettext_err "\${SCRIPT_NAME} must be run as root"
+    exit 1
+  fi
+
+  #----------------------------------------------------------------------------
+  # Parse the input for flags
+  #----------------------------------------------------------------------------
+  while getopts c:DhqVyp name; do
+      case "$name" in
+          c)
+              CONF_FILE_PATH="$(readlink -f "${OPTARG?}")"
+              ;;
+          D)
+              IS_DEBUG='true'
+              ;;
+          h)
+              print_usage
+              exit 0
+              ;;
+          n)
+#              IS_NOOP='true'
+              ;;
+          q)
+              IS_SUPPRESS_OUTPUT='true'
+              ;;
+          V)
+              set -x
+#              IS_VERBOSE_DEBUG='true'
+              ;;
+          y)
+              IS_INTERACTIVE_MODE='false'
+              ;;
+          p)
+              IS_PREP_ONLY='true'
+              ;;
+          ?)
+              print_usage
+              exit 1
+              ;;
+      esac
+  done
+
+  POSITIONAL_ARGS="${*:$OPTIND:$#}"
+
+  # If a config file is specified, assume the user knows what they are doing
+  # This behavior is similar to the old installer.
+  if [[ -n "${CONF_FILE_PATH}" ]]; then
+    IS_INTERACTIVE_MODE='false'
+
+    # Check that the conf actually exists
+    if [[ ! -f "${CONF_FILE_PATH}" ]]; then
+      eval_gettext_err "We couldn't find a PE config file at \${CONF_FILE_PATH}."
+      gettext_err "Verify that a pe.conf exists at the path you provided."
+      exit 1
+    fi
+  fi
+
+  #-------------------------------------------------------------------------
+  # Input validation
+  #-------------------------------------------------------------------------
+  readonly IS_DEBUG
+  readonly IS_NOOP
+  readonly IS_INTERACTIVE_MODE
+  readonly IS_SUPPRESS_OUTPUT
+  readonly IS_VERBOSE_DEBUG
+  readonly IS_PREP_ONLY
+
+  if [[ y = "${IS_SUPPRESS_OUTPUT}" ]]; then
+    # suppress output from the install process
+    exec > /dev/null 2>&1
+  fi
+
+  #-------------------------------------------------------------------------
+  # High-level installer logic
+  #-------------------------------------------------------------------------
+  pushd "${INSTALLER_DIR?}"
+  prepare_logging
+
+  display_pe_header
+
+  backup_previous_build_info
+  detect_platform
+  pre_install_validation
+  pre_upgrade_validation
+
+  # if a config file is not specified
+  if [[ -z "${CONF_FILE_PATH}" ]]; then
+    # ask the user what type of install to do
+    if is_interactive_mode && is_web_install; then
+      launch_web_installer_and_quit
+      # we do not return from here
+    elif [[ -f "${ENTERPRISE_CONF_PATH}" ]]; then
+      use_existing_pe_conf
+    else
+      if is_interactive_mode; then
+        prepare_a_pe_conf
+      else
+        eval_gettext_err "The -y flag cannot be used without the -c flag if a valid pe.conf cannot be found at \${ENTERPRISE_CONF_PATH}."
+        exit 1
+      fi
+    fi
+  fi
+
+  # Confirm that the user would actually like to install using the pe.conf file
+  # located at ${CONF_FILE_PATH} (set by use_existing_pe_conf/prepare_a_pe_conf)
+  if is_interactive_mode && ! confirm_proceed_with_install_or_upgrade; then
+    exit 1
+  fi
+
+  if feature_flag 'pe_modules_next'; then
+    PE_MODULES_NAME='pe-modules-next'
+  fi
+
+  do_install
+  popd
+}
+
+#=== FUNCTION ================================================================
+#        NAME: prepare_logging
+# DESCRIPTION: Prepares logging
+#=============================================================================
+prepare_logging() {
+  mkdir -p "${LOGFILE_DIR?}"
+  touch "${LOGFILE_PATH?}"
+  chmod 600 "${LOGFILE_PATH?}"
+}
+
+#=== FUNCTION ================================================================
+#        NAME: do_install
+# DESCRIPTION: Proceed with an install based on a config file.
+#=============================================================================
+do_install() {
+    disable_puppet_agent
+    install_puppet_agent
+    move_win64_msi
+    # Sanity check on pe.conf file provided
+    validate_pe_conf
+    install_pe
+}
+
+#=== FUNCTION ================================================================
+#        NAME: user_confirmation $TEXT
+# DESCRIPTION: Confirm with user that they actually want to proceed with
+#              $TEXT. Assumes yes by default.
+#=============================================================================
+user_confirmation() {
+  if [[ -z "${1}" ]]; then
+    gettext_err "FATAL: user_confirmation() called without an argument"
+    exit 1
+  fi
+
+  local text="${1}"
+  echo -en "\n ${text} [Yn]"
+  read -r interview_answer
+  if [[ -z "${interview_answer}" || "${interview_answer}" =~ ^[Yy][Ee]?[Ss]? ]]; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+#=== FUNCTION ================================================================
+#        NAME:  gettext_user_confirmation
+# DESCRIPTION:  Translate and Confirm with user that they actually want to proceed with
+#               $TEXT. Assumes yes by default.
+#   ARGUMENTS:
+#               1. Message to be translated and displayed
+#      RETURN:
+#               0 if no answer or yes
+#               1 otherwise
+#=============================================================================
+gettext_user_confirmation() {
+  # shellcheck disable=SC2006
+  translation="`gettext \"${1}\"`"
+  user_confirmation "${translation}"
+}
+
+#=== FUNCTION ================================================================
+#        NAME:  eval_gettext_user_confirmation
+# DESCRIPTION:  Translate and Confirm with user that they actually want to proceed with
+#               $TEXT. Assumes yes by default.
+#   ARGUMENTS:
+#               1. Message to be translated and displayed
+#      RETURN:
+#               0 if no answer or yes
+#               1 otherwise
+#=============================================================================
+eval_gettext_user_confirmation() {
+  # shellcheck disable=SC2006
+  translation="`eval_gettext \"${1}\"`"
+  user_confirmation "${translation}" "${2}"
+}
+
+#=== FUNCTION ================================================================
+#        NAME: confirm_proceed_with_install_or_upgrade
+# DESCRIPTION: Confirm with user that they actually want to proceed with
+#              the upgrade and exits if not. Assumes yes by default.
+#=============================================================================
+confirm_proceed_with_install_or_upgrade() {
+  test_existing_pe_version="$(existing_pe_version)"
+  if [[ -n "${test_existing_pe_version}" ]]; then
+    eval_gettext_user_confirmation "Proceed with upgrade/repair of \${test_existing_pe_version} using the pe.conf at \${CONF_FILE_PATH}?"
+  else
+    eval_gettext_user_confirmation "Proceed with installation using the pe.conf at \${CONF_FILE_PATH}?"
+  fi
+
+  return $?
+}
+
+#=== FUNCTION ================================================================
+#        NAME: pre_install_validation
+# DESCRIPTION: Check the system for conditions which might cause an
+#              install to fail and exit early if a condition is met.
+#=============================================================================
+pre_install_validation() {
+  if [[ "${LOCAL_PLATFORM_TAG}" != "${PLATFORM_TAG}" ]]; then
+    eval_gettext_err "We have detected that you are attempting to use a \${PLATFORM_TAG} PE tarball on \${LOCAL_PLATFORM_TAG}."
+    gettext_err "Please verify you have downloaded the correct installer for your platform."
+    exit 1
+  fi
+}
+
+#=== FUNCTION ================================================================
+#        NAME: pe_version
+# DESCRIPTION: Get the version of PE from the tarball
+#=============================================================================
+pe_version() {
+  cat "${INSTALLER_DIR?}/VERSION" 2> /dev/null
+}
+
+#=== FUNCTION ================================================================
+#        NAME: pe_agent_version
+# DESCRIPTION: Determine the agent version already installed on the system
+#              (if any.) Otherwise, return an empty string.
+#=============================================================================
+pe_agent_version() {
+    if [[ -f "${PUPPET_DIR?}/VERSION" ]]; then
+        build_version=$(cat "${PUPPET_DIR?}/VERSION")
+        echo "${build_version}"
+    else
+        echo ""
+    fi
+}
+
+#=== FUNCTION ================================================================
+#        NAME: pe_link_version
+# DESCRIPTION: Get the version of PE from the tarball formatted for the docs
+#              link.
+#=============================================================================
+pe_link_version() {
+  pe_version | cut -d '.' -f1,2
+}
+
+#=== FUNCTION ================================================================
+#        NAME: existing_pe_version
+# DESCRIPTION: Determine the version of PE already installed on the system
+#              (if any.) Otherwise, return an empty string.
+#=============================================================================
+existing_pe_version() {
+  if [[ -f "${SERVER_DIR}/pe_version" ]]; then
+    installed_version=$(cat "${SERVER_DIR}/pe_version")
+    echo "${installed_version}"
+  else
+    echo ""
+  fi
+}
+
+#=== FUNCTION ================================================================
+#        NAME: backup_previous_build_info
+# DESCRIPTION: Copy current pe_build and puppet/VERSION (if they exist)
+#              so we can rollback system configuration after failure.
+#=============================================================================
+backup_previous_build_info() {
+  local pe_build_file="${SERVER_DIR?}/pe_build"
+  if [ -f "${pe_build_file}" ]; then
+    run "cp ${pe_build_file} ${SERVER_DIR?}/pe_build.bak"
+    run "cp ${PUPPET_DIR?}/VERSION ${SERVER_DIR?}/puppet-agent-version.bak"
+  fi
+}
+
+#=== FUNCTION ================================================================
+#        NAME: pe_build
+# DESCRIPTION: Determine the build version of PE already installed on the
+#              system (if any.) Otherwise, return an empty string.
+#=============================================================================
+pe_build() {
+  if [[ -f "${SERVER_DIR}/pe_build" ]]; then
+    build_version=$(cat "${SERVER_DIR}/pe_build")
+    echo "${build_version}"
+  else
+    echo ""
+  fi
+}
+
+#=== FUNCTION ================================================================
+#        NAME: assert_on_ineffective_build
+# DESCRIPTION: Determine if the build version is older than our current version
+#              and exit if it is.
+#          $1: Build version we're attempting to upgrade from.
+#=============================================================================
+assert_on_ineffective_build() {
+  local installed_effective_date=$1
+  local effective_date=$2
+
+  # All indications are that this will never happen. This is a sanity check just in
+  # case a customer actually upgrades by version but is a downgrade by release date.
+  if ! is_version_less_than "${installed_effective_date}" "${effective_date}" ; then
+      eval_gettext_err "Sorry McFly, you can't upgrade to a version that was released before your current version, chronologically, even if it's part of a newer release line."
+      eval_gettext_err "Release date for your current version: \${installed_effective_date}"
+      eval_gettext_err "Release date for the version you're attempting to upgrade to: \${effective_date}."
+    exit 1
+  else
+    return 0
+  fi
+}
+
+#=== FUNCTION ================================================================
+#        NAME: assert_on_unsupported_version
+# DESCRIPTION: Determine if the build version is unsupported and exit
+#              if it is.
+#          $1: Build version we're attempting to upgrade from.
+#=============================================================================
+assert_on_unsupported_version() {
+  local build_version=$1
+
+  # Testing for empty string because on first install, there will not be
+  # an installed version.
+  assert_on_ineffective_build "${INSTALLED_EFFECTIVE_DATE}" "${EFFECTIVE_DATE}"
+
+  if [ -n "${build_version}" ] &&
+      ! is_version_less_than "${MINIMUM_SUPPORTED_VERSION}" "${build_version}" ; then
+    eval_gettext_err " Upgrades from PE \${build_version} are not supported."
+    exit 1
+  else
+    return 0
+  fi
+}
+
+#=== FUNCTION ================================================================
+#        NAME: assert_on_build_downgrade
+# DESCRIPTION: Determine if the new build version is a downgrade and exit
+#              if it is.
+#          $1: Build version we're attempting to upgrade from.
+#=============================================================================
+assert_on_build_downgrade() {
+  local build_version=$1
+
+  # Compare to PE_BUILD_VERSION from bootstrap-metadata to determine
+  # if we are upgrade.
+  if ! is_version_less_than "${build_version}" "${PE_BUILD_VERSION}"; then
+    eval_gettext_err " Build downgrades are not supported. Attempted to downgrade from PE \${build_version} to PE \${PE_BUILD_VERSION}."
+    exit 1
+  fi
+}
+
+#=== FUNCTION ================================================================
+#        NAME: assert_on_agent_downgrade
+# DESCRIPTION: Determine if the new agent version is a downgrade and exit
+#              if it is.
+#          $1: Agent version we're attempting to upgrade from.
+#=============================================================================
+assert_on_agent_downgrade() {
+  local agent_version=$1
+
+  # Compare to AIO_INSTALL_VERSION from bootstrap-metadata to determine
+  # if we are upgrade.
+  if ! is_version_less_than "${agent_version}" "${AIO_INSTALL_VERSION}" "0000"; then
+    eval_gettext_err " Agent downgrades are not supported. Attempted to downgrade from Agent \${agent_version} to Agent \${AIO_INSTALL_VERSION}."
+    exit 1
+  fi
+}
+
+#=== FUNCTION ================================================================
+#        NAME: assert_on_legacy_version
+# DESCRIPTION: Determine if the installed version is 3.x and exit
+#              if it is.
+#     CAUTION: DO NOT REMOVE THIS. Upgrding form 3.x is "really bad" and
+#              this check needs to remain in place until 3.x no longer
+#              exists in the wild.
+#=============================================================================
+assert_on_legacy_version() {
+  # Disallow upgrades from 3.x
+  if [[ -f "${OLD_OPT_DIR}/pe_version" ]]; then
+    installed_version=$(cat "${OLD_OPT_DIR}/pe_version")
+    eval_gettext_err " Upgrades from PE \${installed_version} are not supported."
+    gettext_err " Review the 2016.2 migration documentation for instructions on moving to this version of PE."
+    exit 1
+  fi
+}
+
+#=== FUNCTION ================================================================
+#        NAME: pre_upgrade_validation
+# DESCRIPTION: Check the system for conditions which might cause an
+#              upgrade to fail and exit early if a condition is met.
+#=============================================================================
+pre_upgrade_validation() {
+  local current_build_version=""
+  local current_agent_version=""
+
+  # Disallow upgrades from 3.x
+  assert_on_legacy_version
+
+  if [ ! -f "${SERVER_DIR?}/pe_build" ]; then
+    return 0 # No 2015+ install means we are not upgrading
+  fi
+
+  # The following locations hold version strings for the different Puppet Enterprise builds,
+  # current version and to be installed version, and can be used for comparisons.
+  #  - PE_BUILD_VERSION
+  #  - existing_pe_version
+  current_build_version=$(pe_build)
+  assert_on_unsupported_version "${current_build_version}"
+  assert_on_build_downgrade "${current_build_version}"
+
+  # The following locations hold version strings for the different Puppet Enterprise Agent builds,
+  # current version and to be installed version, and can be used for comparisons.
+  #  - AIO_INSTALL_VERSION
+  #  - pe_agent_version
+  current_agent_version=$(pe_agent_version)
+  assert_on_agent_downgrade "${current_agent_version}"
+
+
+  if custom_auth_conf; then
+    # eval_gettext does not support function eval, so we must save to a variable
+    # shellcheck disable=SC2034
+    pe_version_var="$(pe_version)"
+    gettext_display_announcement "We've detected a modified auth.conf file in a format that is no longer compatible with Puppet Enterprise \${pe_version_var}."
+    case "$(existing_pe_version)" in
+      2015.2.*)
+        gettext_display "After upgrading, migrate your legacy auth.conf (and any customizations) to the new file format. Refer to the auth.conf migration documentation: https://puppet.com/docs/puppetserver/latest/config_file_auth_migration.html"
+        gettext_user_confirmation "Continue with the upgrade and migrate auth.conf later?"
+        local result=$?
+        if [[ "${result}" != "0" ]]; then
+          exit 1
+        fi
+        ;;
+      *)
+        gettext_display "Before upgrading, migrate your legacy auth.conf (and any customizations) to the new file format. Refer to the auth.conf migration documentation: https://puppet.com/docs/puppetserver/latest/config_file_auth_migration.html"
+        gettext_user_confirmation "Would you like to quit and migrate your existing auth.conf file? Answer no if you have already completed this step."
+        local result=$?
+        if [[ "${result}" != "0" ]]; then
+          exit 1
+        fi
+        ;;
+    esac
+    run "mv /etc/puppetlabs/puppet/auth.conf /etc/puppetlabs/puppet/auth.conf.bak"
+  fi
+}
+
+#=== FUNCTION ================================================================
+#        NAME: is_interactive_mode
+# DESCRIPTION: Return true if the interactive flag has been set
+#=============================================================================
+is_interactive_mode() {
+  if [[ "${IS_INTERACTIVE_MODE}" == 'true' ]]; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+#=== FUNCTION ================================================================
+#        NAME: is_web_install
+# DESCRIPTION: Interview the user about what type of install to do.
+#              Returns 0 if they choose the web install, 1 for text.
+#=============================================================================
+is_web_install() {
+    local interview_answer
+    if [[ -n "$(existing_pe_version)" ]]; then
+      display_new_line
+      # eval_gettext does not support function eval, so we must save to a variable
+      # shellcheck disable=SC2034
+      existing_pe_version_var="$(existing_pe_version)"
+      eval_gettext_display_announcement "We've detected an existing Puppet Enterprise \${existing_pe_version_var} install."
+      gettext_user_confirmation "Would you like to proceed with text-mode upgrade/repair?"
+      local result=$?
+      if [[ "${result}" = "0" ]]; then
+        return 1
+      else
+        # PE-15352 Higgs upgrade/configure is not supported at this time.
+        exit 1
+      fi
+    else
+      gettext_display "Puppet Enterprise offers two different methods of installation."
+      display_new_line
+      display "[1] $(gettext 'Text-mode Install (Recommended)')"
+      display_new_line
+      eval_gettext_display "This method will open your EDITOR (\${EDITOR}) with a PE config file (pe.conf) for you to edit before you proceed with installation."
+      display_new_line
+      gettext_display "The pe.conf file is a HOCON formatted file that declares parameters and values needed to install and configure PE."
+      gettext_display "We recommend that you review it carefully before proceeding."
+      display_new_line
+      display "[2] $(gettext 'Graphical-mode Install')"
+      display_new_line
+      gettext_display "This method will install and configure a temporary webserver to walk you through the various configuration options."
+      display_new_line
+      gettext_display "NOTE: This method requires you to be able to access port 3000 on this machine from your desktop web browser."
+      display_new_line
+      display_line_break
+      display_new_line
+      echo -en "\n $(gettext 'How to proceed?') [1]: "
+      read -r interview_answer
+      if [[ "${interview_answer?}" -eq 2 ]]; then
+          return 0
+      fi
+      return 1
+    fi
+}
+
+#=== FUNCTION ================================================================
+#        NAME: launch_web_installer_and_quit
+# DESCRIPTION: If the user opts for a guided install, launch the web gui
+#=============================================================================
+launch_web_installer_and_quit() {
+    install_puppet_agent
+
+    gettext_display_announcement "We're preparing the Web Installer..."
+    # Launch GUI installer if a config file is not specified.
+    # Start installer service
+    local platform_hostname
+    # shellcheck disable=SC2034
+    platform_hostname="$(/opt/puppetlabs/puppet/bin/facter fqdn)"
+    # This will block
+    pushd "${PUPPET_SHARE_DIR?}/installer" &>/dev/null
+    bin_path="${PUPPET_SHARE_DIR?}/installer/vendor/bundler/bin"
+    run "mkdir -p ${PUPPET_SHARE_DIR?}/installer/installer"
+    run "cp -pR ${INSTALLER_DIR?}/* ${PUPPET_SHARE_DIR?}/installer/installer/"
+    eval_gettext_display_announcement "Go to https://\${platform_hostname}:3000 in your browser to continue installation."
+    gettext_display_announcement "Be sure to use 'https://' and that port 3000 is reachable through the firewall."
+    run "RACK_ENV=production ${bin_path?}/thin start \
+--debug -p 3000 -a 0.0.0.0 --ssl --ssl-disable-verify &> /dev/null"
+    popd &>/dev/null
+    exit 0
+}
+
+#=== FUNCTION ================================================================
+#        NAME: use_existing_pe_conf
+# DESCRIPTION: Set the conf file path to the pre-existing pe.conf.
+#=============================================================================
+use_existing_pe_conf() {
+  eval_gettext_display_announcement "We've found a pe.conf file at \${ENTERPRISE_CONF_PATH}."
+  CONF_FILE_PATH=${ENTERPRISE_CONF_PATH?}
+}
+
+#=== FUNCTION ================================================================
+#        NAME: prepare_a_pe_conf
+# DESCRIPTION: Prepare a pe.conf file to be edited by the user.
+#=============================================================================
+prepare_a_pe_conf() {
+  local custom_pe_conf="${INSTALLER_DIR?}/conf.d/custom-pe.conf"
+  CONF_FILE_PATH=${custom_pe_conf?}
+  if [ -f "${CONF_FILE_PATH?}" ]; then
+    eval_gettext_user_confirmation "We've found a pe.conf file at \${CONF_FILE_PATH}. Do you want to proceed using this file? Answer Y to proceed with configuration. Answer N to open the file in your EDITOR (\${EDITOR})."
+    local result=$?
+    if [[ "${result}" = "0" ]]; then
+      eval_gettext_display_announcement "We'll proceed using pe.conf found at \${CONF_FILE_PATH}..."
+    else
+      edit_pe_conf
+    fi
+  else
+    eval_gettext_display_announcement "We are creating a new pe.conf file at \${CONF_FILE_PATH}..."
+    run "cp ${DEFAULT_CONF_FILE_PATH?} ${CONF_FILE_PATH?}"
+
+    edit_pe_conf
+  fi
+}
+
+#=== FUNCTION ================================================================
+#        NAME: edit_pe_conf
+# DESCRIPTION: Allow the user to edit the specified pe.conf before
+#              proceeding.
+#=============================================================================
+edit_pe_conf() {
+  eval_gettext_display_announcement "We're opening \${CONF_FILE_PATH} in \${EDITOR}..."
+  "${EDITOR?}" "${CONF_FILE_PATH?}"
+  eval_gettext_display_announcement "You edited \${CONF_FILE_PATH} in \${EDITOR}."
+}
+
+#=== FUNCTION ================================================================
+#        NAME: validate_pe_conf
+# DESCRIPTION: Basic sanity check for the pe.conf file before we attempt to use it
+#=============================================================================
+validate_pe_conf() {
+  # Try loading the conf file with Ruby HOCON
+  display_new_line
+  eval_gettext_display_announcement "We're checking if \${CONF_FILE_PATH} contains valid HOCON syntax..."
+  "${PUPPET_BIN_DIR}/ruby" -e "\
+require 'hocon';\
+require 'hocon/config_syntax';\
+;\
+begin;\
+  conf = Hocon.load('${CONF_FILE_PATH}',{:syntax => Hocon::ConfigSyntax::HOCON});\
+rescue Hocon::ConfigError::ConfigParseError => e;\
+  puts %Q{\\nERROR: Your pe.conf at ${CONF_FILE_PATH} contains invalid HOCON syntax: #{e}\\n\\n};\
+  exit 1;\
+end;\
+;\
+if conf['console_admin_password'] && conf['console_admin_password'].empty?;\
+  puts %Q{\\nERROR: Specify a console_admin_password in your pe.conf file at ${CONF_FILE_PATH}.\\n\\n};\
+  exit 1;\
+end"
+
+  local result=$?
+  if [[ "${result}" != "0" ]]; then
+    eval_gettext_err "Your pe.conf file at \${CONF_FILE_PATH} contains errors."
+    gettext_err "Check your pe.conf file for errors and try re-running the installer."
+    exit 1
+  fi
+}
+
+#=== FUNCTION ================================================================
+#        NAME: detect_platform
+# DESCRIPTION: Detects the platforms package manager by checking for
+#              the existence of a /etc/*-release file. Sets the global
+#              variable PLATFORM_PACKAGING, otherwise exits 1 if it
+#              cannot determine the package manager.
+#
+#              Detects the release and architecture of the platform,
+#              and sets the global variable LOCAL_PLATFORM_TAG.
+#
+#              This is a naive implementation, but still a bit safer
+#              then relying only on the precense of 'rpm' or 'apt'
+#              packages being available, since apt could be installed on
+#              rpm for example.
+#=============================================================================
+detect_platform() {
+  if [ -f /etc/redhat-release ]; then
+    PLATFORM_PACKAGING='rpm'
+    PLATFORM_NAME='el'
+    # Release - take first digits after ' release ' only.
+    PLATFORM_RELEASE="$(sed 's/.*\ release\ \([[:digit:]]\+\).*/\1/g;q' /etc/redhat-release)"
+  elif [ -f /etc/system-release ] && grep -q Amazon /etc/system-release; then
+    PLATFORM_PACKAGING='rpm'
+    PLATFORM_NAME='el'
+    t_version_year=$(grep image_version /etc/image-id | cut -d\" -f2 | cut -d. -f1)
+    t_version_month=$(grep image_version /etc/image-id | cut -d\" -f2 | cut -d. -f2)
+    if [ -z "$t_version_year" ] || [ -z "$t_version_month" ]; then
+      gettext_err "Unable to parse Amazon Linux version info from /etc/image-id"
+      exit 1
+    else
+        # 2017.12 and later is Amazon Linux v2 (platform 7)
+        if [ "$t_version_year" -gt "2017" ]; then
+            PLATFORM_RELEASE=7
+        elif [ "$t_version_year" == "2017" ] && [ "$t_version_month" == "12" ]; then
+            PLATFORM_RELEASE=7
+        else
+            PLATFORM_RELEASE=6
+        fi
+    fi
+  elif [ -f /etc/SuSE-release ]; then
+    PLATFORM_PACKAGING='zypper'
+    PLATFORM_NAME='sles'
+    PLATFORM_RELEASE="$(grep VERSION /etc/SuSE-release | sed 's/^VERSION = \(\d*\)/\1/')"
+  elif cmd "lsb_release"; then
+    # Ubuntu doesn't have a *-release file,
+    # and lsb_release isn't installed by default on other platforms
+    # so fall back to this after looking for the others.
+    local lsb_release_id
+    lsb_release_id=$(lsb_release -is)
+    if [ "${lsb_release_id}" = "Ubuntu" ]; then
+      PLATFORM_PACKAGING='apt'
+      PLATFORM_NAME='ubuntu'
+      PLATFORM_RELEASE="$(lsb_release -rs)"
+    fi
+  fi
+
+  PLATFORM_ARCHITECTURE="$(uname -m)"
+  case "${PLATFORM_ARCHITECTURE?}" in
+    x86_64)
+        case "${PLATFORM_NAME?}" in
+            ubuntu | debian )
+                PLATFORM_ARCHITECTURE=amd64
+                ;;
+        esac
+        ;;
+  esac
+
+  if [ -z "${LOCAL_PLATFORM_TAG:-""}" ]; then
+    LOCAL_PLATFORM_TAG="${PLATFORM_NAME?}-${PLATFORM_RELEASE?}-${PLATFORM_ARCHITECTURE?}"
+  fi
+
+  if [ -z "${PLATFORM_PACKAGING:-""}" ]; then
+    gettext_err "Unknown Platform. Visit https://puppet.com/docs/pe/latest/supported_operating_systems.html"
+    exit 1
+  else
+    readonly PLATFORM_PACKAGING
+    readonly LOCAL_PLATFORM_TAG
+  fi
+}
+
+#=== FUNCTION ================================================================
+#        NAME:  disable_puppet_agent
+# DESCRIPTION:  Sets the disable lockfile preventing puppet agent runs.
+#
+#               This routine also traps INT TERM EXIT and QUIT signals,
+#               registering enable_puppet_agent so that we are
+#               reasonably sure to remove the disable lockfile before
+#               exiting.  Kill cannot be trapped.
+#=============================================================================
+disable_puppet_agent() {
+  if [ -e "${PUPPET_BIN_DIR?}/puppet" ]; then
+    trap enable_puppet_agent EXIT
+    trap "enable_puppet_agent; exit 1" INT TERM QUIT
+    run "${PUPPET_BIN_DIR?}/puppet agent \
+      --disable='puppet-enterprise-installer preparing to configure node'"
+  fi
+}
+
+#=== FUNCTION ================================================================
+#        NAME:  enable_puppet_agent
+# DESCRIPTION:  Clears the disable lockfile, allowing puppet agent runs.
+#=============================================================================
+enable_puppet_agent() {
+  [ -e "${PUPPET_BIN_DIR?}/puppet" ] && run "${PUPPET_BIN_DIR?}/puppet agent --enable"
+}
+
+#=== FUNCTION ================================================================
+#        NAME: set_repo_configuration
+# DESCRIPTION: Prepare platform specific package manager repository
+#              configuration pointing to the given local directory.
+#          $1: Absolute path to a directory with the local packages and
+#              metadata we want to configure to
+#=============================================================================
+set_repo_configuration() {
+  local pkg_dir=${1?}
+
+  case "${PLATFORM_PACKAGING?}" in
+    rpm)
+      # Why would we need to create this folder? copied from old installer
+      run "mkdir -p /etc/yum.repos.d"
+      # Create repo file
+      local repo_file="/etc/yum.repos.d/${PE_REPO_NAME?}.repo"
+      run "echo '[${PE_REPO_NAME}]' > ${repo_file}"
+      run "echo 'name=PuppetLabs PE Packages \$releasever - \$basearch' >> ${repo_file}"
+      run "echo 'baseurl=file://${pkg_dir?}' >> ${repo_file}"
+      run "echo 'enabled=1' >> ${repo_file}"
+      run "echo 'gpgcheck=1' >> ${repo_file}"
+      run "echo -e 'gpgkey=file://${PACKAGE_DIR?}/GPG-KEY-puppetlabs\n       file://${PACKAGE_DIR?}/GPG-KEY-puppet' >> ${repo_file}"
+     run "yum clean all --disablerepo='*' --enablerepo=${PE_REPO_NAME?}"
+      ;;
+    zypper)
+      # Zypper's service-add command fails if the service name is
+      # already in use. To always ensure we have the latest repo, delete
+      # the service if it already exists before adding it.
+      if zypper service-list | grep -q "${PE_REPO_NAME?}"; then
+        run "zypper service-delete ${PE_REPO_NAME?}"
+      fi
+      run "zypper service-add --type=yum file://'${pkg_dir?}' ${PE_REPO_NAME?}"
+      run "zypper refresh --repo ${PE_REPO_NAME?} || :"
+      ;;
+    apt)
+      run "mkdir -p /etc/apt/sources.list.d"
+      run "echo 'deb file:${pkg_dir?} ./' > /etc/apt/sources.list.d/${PE_REPO_NAME?}.list"
+      run "apt-get update -q -y"
+      ;;
+  esac
+}
+
+#=== FUNCTION ================================================================
+#        NAME:  remove_packages
+# DESCRIPTION:  Invoke platform specific package manager to remove a
+#               list of packages.
+#          $@:  package list
+#=============================================================================
+remove_packages() {
+  declare -a packages
+  packages=($@)
+
+  case "${PLATFORM_PACKAGING?}" in
+    rpm)
+      run "yum remove -y ${packages[*]}"
+      ;;
+    zypper)
+      run "zypper --non-interactive remove ${packages[*]}"
+      ;;
+    apt)
+      run "apt-get remove -y ${packages[*]}"
+      ;;
+  esac
+}
+
+#=== FUNCTION ================================================================
+#        NAME:  generate_versioned_package_list
+# DESCRIPTION:  Converte a generic package=version list to a platform
+#               specific one suitable for rpm, apt or zypper
+#          $@:  package list
+#=============================================================================
+generate_versioned_package_list() {
+  declare -a packages
+  for package in "$@"; do
+    local name=${package%=*}
+    local version
+    if [ "${name}" != "${package}" ]; then
+      version=${package#*=}
+    else
+      version=''
+    fi
+    local parsed_package
+
+    if [ -z "${version}" ]; then
+      parsed_package="$package"
+    else
+      case "${PLATFORM_PACKAGING?}" in
+        rpm) parsed_package="${name}-${version}" ;;
+        apt) parsed_package="${name}=${version}*" ;;
+        *)   parsed_package="$package" ;;
+      esac
+    fi
+    packages=(${packages[*]} $parsed_package)
+  done
+  echo "${packages[*]}"
+}
+
+#=== FUNCTION ================================================================
+#        NAME:  install_packages
+# DESCRIPTION:  Invoke platform specific package manager to install a
+#               list of packages.
+#          $@:  package list
+#=============================================================================
+install_packages() {
+  declare -a packages
+  packages=($(generate_versioned_package_list "$@"))
+
+  case "${PLATFORM_PACKAGING?}" in
+    rpm)
+      run "yum install -y ${packages[*]}"
+      ;;
+    zypper)
+      run "zypper --non-interactive install --repo ${PE_REPO_NAME?} ${packages[*]}"
+      ;;
+    apt)
+      run "DEBIAN_FRONTEND=noninteractive apt-get install -y ${APT_GET_ARGS?} ${packages[*]}"
+      ;;
+  esac
+  local result=$?
+  if [ "${result?}" != 0 ]; then
+    eval_gettext_err "Unable to install packages: \${packages}"
+    exit 1
+  fi
+}
+
+#=== FUNCTION ================================================================
+#        NAME:  move_win64_msi
+# DESCRIPTION:  Moves the 64 bit windows msi package into place so
+#               pe_repo will work seamlessly.
+#=============================================================================
+move_win64_msi() {
+  local base_pkg_dir="${PACKAGE_DIR?}/${PE_BUILD_VERSION?}"
+  local win64_installer_pkg_path="${INSTALLER_DIR?}/packages/windows-x86_64"
+  local win64_pkg_dir="${base_pkg_dir?}/windows-x86_64-${AIO_AGENT_VERSION?}"
+
+  run "mkdir -p ${win64_pkg_dir?}"
+  run "cp ${win64_installer_pkg_path?}/puppet-agent-${AIO_INSTALL_VERSION?}-x64.msi ${win64_pkg_dir?}/puppet-agent-x64.msi"
+}
+
+#=== FUNCTION ================================================================
+#        NAME:  install_puppet_agent
+# DESCRIPTION:  Installs puppet agent by configuring a local package
+#               repository and calling the respective install commands.
+#=============================================================================
+install_puppet_agent() {
+  local base_pkg_dir="${PACKAGE_DIR?}/${PE_BUILD_VERSION?}"
+  local pkg_dir="${base_pkg_dir?}/${PLATFORM_TAG?}-${AIO_AGENT_VERSION?}"
+  local installer_pkg_path="${INSTALLER_DIR?}/packages"
+  local installer_legacy_gpg_key_path="${installer_pkg_path?}/GPG-KEY-puppetlabs"
+  local installer_gpg_key_path="${installer_pkg_path?}/GPG-KEY-puppet"
+  local global_hiera_yaml_path="/etc/puppetlabs/puppet/hiera.yaml"
+
+  gettext_display_announcement "We're installing the Puppet Agent..."
+  run "mkdir -p ${pkg_dir?}"
+  run "cp -r -L ${installer_pkg_path?}/${PLATFORM_TAG?}/* ${pkg_dir?}"
+  run "cp -r -L ${installer_legacy_gpg_key_path?} ${PACKAGE_DIR?}"
+  run "cp -r -L ${installer_gpg_key_path?} ${PACKAGE_DIR?}"
+
+  # Install the default PE global hiera.yaml file on new installs, skip on upgrades
+  if [[ -z $(existing_pe_version) ]]; then
+      run "mkdir -p $(dirname ${global_hiera_yaml_path})"
+      run "cp conf.d/global_hiera.yaml ${global_hiera_yaml_path}"
+  fi
+
+  # Add keys
+  case "${PLATFORM_PACKAGING?}" in
+    rpm|zypper)
+      run "rpm --import ${installer_legacy_gpg_key_path?}"
+      run "rpm --import ${installer_gpg_key_path?}"
+      ;;
+    apt)
+      run "APT_KEY_DONT_WARN_ON_DANGEROUS_USAGE=1 apt-key add ${installer_legacy_gpg_key_path?}"
+      run "APT_KEY_DONT_WARN_ON_DANGEROUS_USAGE=1 apt-key add ${installer_gpg_key_path?}"
+      ;;
+  esac
+
+  set_repo_configuration "${pkg_dir?}"
+
+  if feature_flag 'pe_modules_next'; then
+    # Uninstall pe-modules so that it doesn't conflict with
+    # pe-modules-next
+    remove_packages "pe-modules"
+  fi
+  install_packages "puppet-agent=${AIO_INSTALL_VERSION:?}" "pe-installer" "${PE_MODULES_NAME:?}"
+}
+
+#=== FUNCTION ================================================================
+#        NAME:  rollback
+# DESCRIPTION:  Resets repository configuration, downgrades packages,
+#               resets pe_build file; but only if we were installing
+#               over a previous installation.
+#
+#               Note: this can only be used before PE services have been
+#               upgraded and restarted. At that point, the services will
+#               have begun migrating their database schemas and cannot
+#               be rolled back.
+#
+#               Currently we are only using this function to reset the
+#               puppet-agent, pe-modules and pe-installer package after
+#               puppet-infra configure validation has failed and before
+#               a catalog has been applied to begin the rest of the
+#               upgrade.
+#=============================================================================
+rollback_upgrade() {
+  local previous_pe_build_file="${SERVER_DIR?}/pe_build.bak"
+  if [ -f "${previous_pe_build_file}" ]; then
+    local previous_pe_build
+    previous_pe_build=$(cat "${previous_pe_build_file}")
+    local previous_aio_version
+    previous_aio_version=$(cat "${SERVER_DIR?}/puppet-agent-version.bak")
+    local pkg_dir="${PACKAGE_DIR?}/${previous_pe_build}/${PLATFORM_TAG?}-${previous_aio_version}"
+    gettext_wrapped_err "Validation failure." "!!"
+    eval_gettext_display "Rolling puppet-agent back to \${previous_aio_version}."
+    eval_gettext_display "Rolling pe-modules back to PE \${previous_pe_build}."
+
+    run "cp ${previous_pe_build_file} ${SERVER_DIR?}/pe_build"
+    set_repo_configuration "${pkg_dir}"
+    case "${PLATFORM_PACKAGING?}" in
+      rpm)
+        remove_packages "pe-installer"
+        run "yum downgrade -y puppet-agent pe-modules"
+        ;;
+      zypper)
+        remove_packages "pe-installer" "pe-modules"
+        # --oldpackage is required to get the package downgraded on SLES
+        run "zypper --non-interactive install --repo ${PE_REPO_NAME?} --oldpackage puppet-agent=${previous_aio_version:?} pe-modules"
+        ;;
+      apt)
+        remove_packages "pe-installer" "pe-modules"
+        # --force-yes is required to get the package downgraded on Debian
+        run "DEBIAN_FRONTEND=noninteractive apt-get install -y --force-yes ${APT_GET_ARGS?} puppet-agent=${previous_aio_version:?}* pe-modules"
+        ;;
+    esac
+  fi
+}
+
+install_pe() {
+  eval_gettext_display_announcement "We're configuring PE using \${CONF_FILE_PATH}..."
+
+  local current_pe_build
+  current_pe_build=$(pe_build)
+
+  # Copy the effective date into place.
+  echo "${EFFECTIVE_DATE}" > "${BUILD_DATE_FILE}"
+
+  # Copy the pe_build version file into place
+  run "mkdir -p ${SERVER_DIR?}"
+  run "cp -L ${INSTALLER_DIR?}/VERSION ${SERVER_DIR?}/pe_build"
+  run "chown root:root ${SERVER_DIR?}/pe_build"
+  run "chmod 644 ${SERVER_DIR?}/pe_build"
+
+  # Copy the hiera.yaml and conf file into place
+  CONF_FILE_DEST="${ENTERPRISE_CONF_DIR?}/pe.conf"
+  if [ -f "${CONF_FILE_DEST?}" ]; then
+    run "cp ${CONF_FILE_DEST?} ${ENTERPRISE_CONF_DIR?}/pe-$(get_unix_timestamp).conf"
+  fi
+  if [ "${CONF_FILE_PATH?}" != "${CONF_FILE_DEST?}" ]; then
+    run "cp ${CONF_FILE_PATH?} ${CONF_FILE_DEST?}"
+  fi
+  if [ -z "${current_pe_build}" ]; then
+    run "chown root:root ${CONF_FILE_DEST?}"
+    run "chmod 600 ${CONF_FILE_DEST?}"
+    # pe.conf permissions managed by puppet_enterprise::master::meep
+  fi
+
+  # Copy the uninstaller
+  run "cp ${INSTALLER_DIR?}/puppet-enterprise-uninstaller /opt/puppetlabs/bin"
+  run "chown root:root /opt/puppetlabs/bin/puppet-enterprise-uninstaller"
+  run "chmod 755 /opt/puppetlabs/bin/puppet-enterprise-uninstaller"
+
+  if [ "${IS_DEBUG?}" = "true" ]; then
+    local debug_flag="--debug"
+  else
+    local debug_flag=""
+  fi
+
+  local upgrade_from_flag
+  if [ -n "${current_pe_build}" ] &&
+     [ "${current_pe_build}" != "${PE_BUILD_VERSION?}" ]; then
+    upgrade_from_flag="--upgrade-from=$current_pe_build"
+  else
+    upgrade_from_flag=""
+  fi
+
+  if [ "${IS_PREP_ONLY?}" = "false" ]; then
+
+    declare -a cmd
+    cmd=(
+      "${PUPPET_BIN_DIR?}/puppet infrastructure configure"
+      "${debug_flag?}"
+      "--detailed-exitcodes"
+      "--environmentpath ${ENVIRONMENTPATH?}"
+      "--environment ${ENVIRONMENT?}"
+      "--no-noop"
+      "--install=$(pe_version)"
+      "${upgrade_from_flag?}"
+      "${POSITIONAL_ARGS}"
+    )
+
+    local count=0
+    local blocking=true
+    while ${blocking?} && [ "${count?}" -le 36 ]; do
+      run "${cmd[*]}"
+      local result=$?
+      if [ "${result?}" = 17 ]; then
+        # puppet enterprise configure returns 17 if agent lockfile is up
+        gettext_display '* waiting for an agent run to complete...'
+        sleep 5
+      else
+        local blocking=false
+      fi
+      local count=$((count + 1))
+    done
+  else
+    local result=0
+  fi
+
+  display "* ${cmd[*]}"
+  display "* returned: ${result}"
+  case "${result}" in
+    0 | 2)
+      # eval_gettext does not support function eval, so we must save to a variable
+      # shellcheck disable=SC2034
+      pe_link_version_var="$(pe_link_version)"
+      gettext_display_announcement "Puppet Enterprise configuration complete!"
+      eval_gettext_display "Documentation: https://puppet.com/docs/pe/\${pe_link_version_var}/pe_user_guide.html"
+      eval_gettext_display "Release notes: https://puppet.com/docs/pe/\${pe_link_version_var}/pe_release_notes.html"
+      display_new_line
+
+      if [ "${IS_PREP_ONLY?}" = "false" ]; then
+        gettext_display "If this is a monolithic configuration, run 'puppet agent -t' to complete the setup of this system."
+        display_new_line
+        gettext_display "If this is a split configuration, install or upgrade the remaining PE components, and then run puppet agent -t on the Puppet master, PuppetDB, and PE console, in that order."
+      else
+        gettext_display "To finish configuration, run puppet-enterprise-installer again without the -p flag"
+      fi
+      ;;
+    *)
+      if [ "${result}" == '27' ] &&
+         ! is_version_less_than "${current_pe_build}" "${MINIMUM_VERSION_FOR_ROLLBACK}"; then
+
+        # validation failed before we began the installation
+        rollback_upgrade
+      fi
+      gettext_wrapped_err "There were problems during the application of the installation catalog." "!!"
+      eval_gettext_wrapped_err "Review the logs at \${LOGFILE_PATH} and resolve any issues you can find." "!!"
+      gettext_wrapped_err "After fixing any errors, re-run the installer to complete the installation or upgrade." "!!"
+      exit ${result}
+      ;;
+  esac
+}
+
+if [ "${SCRIPT_NAME}" == 'puppet-enterprise-installer' ]; then
+    main "$@"
+fi
+
+# vim: tabstop=2:softtabstop=2:shiftwidth=2:expandtab:tw=72:fo=cqt:wm=0
